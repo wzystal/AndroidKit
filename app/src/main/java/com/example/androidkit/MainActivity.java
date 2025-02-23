@@ -7,6 +7,7 @@ import androidx.fragment.app.FragmentManager;
 import androidx.fragment.app.FragmentPagerAdapter;
 import androidx.viewpager.widget.ViewPager;
 import com.google.android.material.tabs.TabLayout;
+import android.widget.Button;
 import android.widget.EditText;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,6 +17,7 @@ public class MainActivity extends AppCompatActivity {
     private TabLayout tabLayout;
     private ViewPager viewPager;
     private EditText inputBox;
+    private Button sendButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -25,15 +27,18 @@ public class MainActivity extends AppCompatActivity {
         tabLayout = findViewById(R.id.tabLayout);
         viewPager = findViewById(R.id.viewPager);
         inputBox = findViewById(R.id.inputBox);
+        sendButton = findViewById(R.id.sendButton);
 
         setupViewPager(viewPager);
         tabLayout.setupWithViewPager(viewPager);
 
-        // 处理输入框的输入事件
-        inputBox.setOnEditorActionListener((v, actionId, event) -> {
+        // 处理发送按钮的点击事件
+        sendButton.setOnClickListener(v -> {
             String inputText = inputBox.getText().toString();
-            // 处理输入的文字
-            return true;
+            // 获取当前显示的Fragment
+            SampleFragment currentFragment = (SampleFragment) ((ViewPagerAdapter) viewPager.getAdapter()).getItem(viewPager.getCurrentItem());
+            // 更新Fragment中的文字
+            currentFragment.updateText(inputText);
         });
     }
 
