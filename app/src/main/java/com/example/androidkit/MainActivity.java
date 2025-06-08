@@ -1,81 +1,93 @@
 package com.example.androidkit;
 
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
-import androidx.appcompat.app.AppCompatActivity;
-import androidx.fragment.app.Fragment;
-import androidx.fragment.app.FragmentManager;
-import androidx.fragment.app.FragmentPagerAdapter;
-import androidx.viewpager.widget.ViewPager;
-import com.google.android.material.tabs.TabLayout;
 import android.widget.Button;
 import android.widget.EditText;
-import java.util.ArrayList;
-import java.util.List;
+import android.widget.Toast;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
 public class MainActivity extends AppCompatActivity {
+    private static final String TAG = "wzy-MainActivity";
+    private static final int PERMISSION_REQUEST_CODE = 100;
 
-    private TabLayout tabLayout;
-    private ViewPager viewPager;
     private EditText inputBox;
     private Button sendButton;
+    private Button saveButton;
+    private Button loadButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        tabLayout = findViewById(R.id.tabLayout);
-        viewPager = findViewById(R.id.viewPager);
         inputBox = findViewById(R.id.inputBox);
         sendButton = findViewById(R.id.sendButton);
+        saveButton = findViewById(R.id.saveButton);
+        loadButton = findViewById(R.id.loadButton);
 
-        setupViewPager(viewPager);
-        tabLayout.setupWithViewPager(viewPager);
-
-        // 处理发送按钮的点击事件
         sendButton.setOnClickListener(v -> {
-            String inputText = inputBox.getText().toString();
-            // 获取当前显示的Fragment
-            SampleFragment currentFragment = (SampleFragment) ((ViewPagerAdapter) viewPager.getAdapter()).getItem(viewPager.getCurrentItem());
-            // 更新Fragment中的文字
-            currentFragment.updateText(inputText);
+            // 可按需实现发送逻辑
+        });
+
+        saveButton.setOnClickListener(v -> {
+            String textToSave = inputBox.getText().toString().trim();
+            if (textToSave.isEmpty()) {
+                Toast.makeText(this, "请输入要保存的文本", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            boolean success = ExternalStorageUtils.saveStringToExternalStorage(this, textToSave);
+            if (success) {
+                Toast.makeText(this, "文本已成功保存到外部存储", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "保存失败，请检查日志", Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        loadButton.setOnClickListener(v -> {
+            String loadedText = ExternalStorageUtils.readStringFromExternalStorage(this);
+            if (loadedText != null) {
+                inputBox.setText(loadedText);
+                Toast.makeText(this, "文本已成功从外部存储加载", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "加载失败，可能是文件不存在或读取错误", Toast.LENGTH_SHORT).show();
+            }
         });
     }
 
-    private void setupViewPager(ViewPager viewPager) {
-        ViewPagerAdapter adapter = new ViewPagerAdapter(getSupportFragmentManager());
-        adapter.addFragment(new SampleFragment(), "首页");
-        adapter.addFragment(new SampleFragment(), "对话");
-        adapter.addFragment(new SampleFragment(), "服务");
-        viewPager.setAdapter(adapter);
+    /**
+     * 检查并请求必要的权限
+     * @return 如果已有权限返回true，否则返回false
+     */
+    private boolean checkAndRequestPermissions() {
+        // Android 10 (API 29)及以上版本不需要请求外部存储权限
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                                Manifest.permission.READ_EXTERNAL_STORAGE},
+                        PERMISSION_REQUEST_CODE);
+                return false;
+            }
+        }
+        return true;
     }
 
-    class ViewPagerAdapter extends FragmentPagerAdapter {
-        private final List<Fragment> fragmentList = new ArrayList<>();
-        private final List<String> fragmentTitleList = new ArrayList<>();
-
-        public ViewPagerAdapter(FragmentManager fragmentManager) {
-            super(fragmentManager, BEHAVIOR_RESUME_ONLY_CURRENT_FRAGMENT);
-        }
-
-        @Override
-        public Fragment getItem(int position) {
-            return fragmentList.get(position);
-        }
-
-        @Override
-        public int getCount() {
-            return fragmentList.size();
-        }
-
-        @Override
-        public CharSequence getPageTitle(int position) {
-            return fragmentTitleList.get(position);
-        }
-
-        public void addFragment(Fragment fragment, String title) {
-            fragmentList.add(fragment);
-            fragmentTitleList.add(title);
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "权限已授予，可以使用外部存储", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "权限被拒绝，无法使用外部存储", Toast.LENGTH_SHORT).show();
+            }
         }
     }
 }
