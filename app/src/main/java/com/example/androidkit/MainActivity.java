@@ -2,12 +2,16 @@ package com.example.androidkit;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.RecoverableSecurityException;
 import android.content.Intent;
 import android.content.IntentSender;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.widget.Button;
@@ -21,6 +25,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import java.io.File;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
@@ -36,8 +41,14 @@ public class MainActivity extends AppCompatActivity {
     // 用于处理MediaStore.createWriteRequest的结果
     private ActivityResultLauncher<IntentSenderRequest> writePermissionLauncher;
     
+    // 操作类型枚举
+    private enum OperationType {
+        NONE,
+        SAVE,
+        LOAD
+    }
+    
     // 保存当前操作类型，用于权限请求后的回调
-    private enum OperationType { NONE, SAVE, LOAD }
     private OperationType pendingOperation = OperationType.NONE;
     private String pendingSaveText = null;
 
@@ -113,9 +124,15 @@ public class MainActivity extends AppCompatActivity {
      * 保存文本到外部存储
      */
     private void saveText(String text) {
+        pendingOperation = OperationType.SAVE;
+        pendingSaveText = text;
+        
         boolean success = ExternalStorageUtils.saveStringToExternalStorage(this, text);
         if (success) {
             Toast.makeText(this, "文本已成功保存到外部存储", Toast.LENGTH_SHORT).show();
+            // 重置状态
+            pendingOperation = OperationType.NONE;
+            pendingSaveText = null;
         } else {
             // 如果保存失败，可能是权限问题，尝试请求权限
             requestWritePermissionIfNeeded();
@@ -126,12 +143,23 @@ public class MainActivity extends AppCompatActivity {
      * 从外部存储加载文本
      */
     private void loadText() {
-        String loadedText = ExternalStorageUtils.readStringFromExternalStorage(this);
-        if (loadedText != null) {
-            inputBox.setText(loadedText);
-            Toast.makeText(this, "文本已成功从外部存储加载", Toast.LENGTH_SHORT).show();
-        } else {
-            // 如果加载失败，可能是权限问题，尝试请求权限
+        pendingOperation = OperationType.LOAD;
+        
+        try {
+            String loadedText = ExternalStorageUtils.readStringFromExternalStorage(this);
+            if (loadedText != null) {
+                inputBox.setText(loadedText);
+                Toast.makeText(this, "文本已成功从外部存储加载", Toast.LENGTH_SHORT).show();
+                // 重置状态
+                pendingOperation = OperationType.NONE;
+            } else {
+                // 如果加载失败，可能是权限问题，尝试请求权限
+                Log.d(TAG, "加载文本返回null，尝试请求权限");
+                requestWritePermissionIfNeeded();
+            }
+        } catch (SecurityException e) {
+            // 捕获权限异常，直接请求权限
+            Log.e(TAG, "加载文本时捕获到SecurityException，直接请求权限", e);
             requestWritePermissionIfNeeded();
         }
     }
@@ -141,22 +169,96 @@ public class MainActivity extends AppCompatActivity {
      */
     private void requestWritePermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            List<Uri> uris = ExternalStorageUtils.getPendingPermissionUris();
-            if (uris.isEmpty()) {
-                Log.d(TAG, "没有需要请求权限的URI");
-                Toast.makeText(this, "操作失败，无法找到目标文件", Toast.LENGTH_SHORT).show();
+            Log.d(TAG, "Android 11+，尝试请求文件访问权限");
+            
+            // 先尝试使用SAF（Storage Access Framework）请求访问权限
+            try {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("text/plain");
+                // 尝试定位到目标文件所在目录
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    File downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                    File targetDir = new File(downloadDir, "Android/syskit");
+                    Uri startDir = Uri.parse("content://com.android.externalstorage.documents/document/primary:Download/Android/syskit");
+                    intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, startDir);
+                }
+                Log.d(TAG, "启动SAF请求文件访问权限");
+                startActivityForResult(intent, WRITE_REQUEST_CODE);
                 return;
+            } catch (Exception e) {
+                Log.e(TAG, "启动SAF失败", e);
             }
             
-            try {
-                Log.d(TAG, "请求文件访问权限，URI数量: " + uris.size());
-                IntentSender sender = MediaStore.createWriteRequest(getContentResolver(), uris).getIntentSender();
-                IntentSenderRequest request = new IntentSenderRequest.Builder(sender).build();
-                writePermissionLauncher.launch(request);
-            } catch (Exception e) {
-                Log.e(TAG, "请求文件权限失败", e);
-                Toast.makeText(this, "请求文件权限失败: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-            }
+            // 如果SAF失败，尝试使用MediaStore API
+            // 先尝试扫描媒体文件，确保MediaStore能识别到文件
+            ExternalStorageUtils.scanMediaFile(this);
+            
+            // 等待扫描完成后再请求权限
+            new Handler().postDelayed(() -> {
+                // 尝试直接读取文件，如果失败则捕获安全异常
+                try {
+                    String result = ExternalStorageUtils.readStringFromExternalStorage(this);
+                    if (result != null) {
+                        Log.d(TAG, "成功读取文件，无需请求权限");
+                        Toast.makeText(this, "文件读取成功", Toast.LENGTH_SHORT).show();
+                        inputBox.setText(result);
+                        return;
+                    }
+                } catch (SecurityException securityException) {
+                    Log.e(TAG, "读取文件时发生安全异常，尝试请求权限", securityException);
+                    
+                    // 从异常中提取RecoverableSecurityException
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && 
+                            securityException instanceof RecoverableSecurityException) {
+                        try {
+                            Log.d(TAG, "检测到RecoverableSecurityException，尝试请求权限");
+                            RecoverableSecurityException recoverableSecurityException = 
+                                    (RecoverableSecurityException) securityException;
+                            IntentSender intentSender = recoverableSecurityException.getUserAction()
+                                    .getActionIntent().getIntentSender();
+                            IntentSenderRequest request = new IntentSenderRequest.Builder(intentSender).build();
+                            writePermissionLauncher.launch(request);
+                            return;
+                        } catch (Exception e) {
+                            Log.e(TAG, "处理RecoverableSecurityException失败", e);
+                        }
+                    }
+                }
+                
+                // 如果上面的方法失败，尝试使用createWriteRequest
+                List<Uri> uris = ExternalStorageUtils.getPendingPermissionUris();
+                if (uris.isEmpty()) {
+                    Log.d(TAG, "没有需要请求权限的URI");
+                    Toast.makeText(this, "操作失败，无法找到目标文件", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                
+                try {
+                    Log.d(TAG, "请求文件访问权限，URI数量: " + uris.size());
+                    for (Uri uri : uris) {
+                        Log.d(TAG, "请求权限的URI: " + uri);
+                    }
+                    IntentSender sender = MediaStore.createWriteRequest(getContentResolver(), uris).getIntentSender();
+                    IntentSenderRequest request = new IntentSenderRequest.Builder(sender).build();
+                    writePermissionLauncher.launch(request);
+                } catch (Exception e) {
+                    Log.e(TAG, "请求文件权限失败", e);
+                    Toast.makeText(this, "请求文件权限失败: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                    
+                    // 如果createWriteRequest失败，尝试使用ACTION_OPEN_DOCUMENT
+                    try {
+                        Log.d(TAG, "尝试使用ACTION_OPEN_DOCUMENT请求权限");
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);
+                        intent.setType("text/plain");
+                        startActivityForResult(intent, WRITE_REQUEST_CODE);
+                    } catch (Exception ex) {
+                        Log.e(TAG, "启动ACTION_OPEN_DOCUMENT失败", ex);
+                        Toast.makeText(this, "无法请求文件权限，请尝试重新安装应用", Toast.LENGTH_LONG).show();
+                    }
+                }
+            }, 1000); // 给媒体扫描一些时间
         }
     }
 
@@ -200,6 +302,50 @@ public class MainActivity extends AppCompatActivity {
             }
             pendingOperation = OperationType.NONE;
             pendingSaveText = null;
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        
+        if (requestCode == WRITE_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
+            if (data != null && data.getData() != null) {
+                Uri uri = data.getData();
+                Log.d(TAG, "获取到SAF文件访问权限，URI: " + uri);
+                
+                // 获取持久化权限
+                final int takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+                getContentResolver().takePersistableUriPermission(uri, takeFlags);
+                
+                // 保存URI供后续使用
+                ExternalStorageUtils.setSafUri(uri);
+                
+                // 根据之前的操作类型执行相应操作
+                if (pendingOperation == OperationType.SAVE && pendingSaveText != null) {
+                    // 如果是保存操作，使用SAF URI保存内容
+                    boolean success = ExternalStorageUtils.writeStringToSafUri(this, uri, pendingSaveText);
+                    if (success) {
+                        Toast.makeText(this, "文本已成功保存到外部存储", Toast.LENGTH_SHORT).show();
+                    } else {
+                        Toast.makeText(this, "保存失败", Toast.LENGTH_SHORT).show();
+                    }
+                    // 重置状态
+                    pendingOperation = OperationType.NONE;
+                    pendingSaveText = null;
+                } else if (pendingOperation == OperationType.LOAD) {
+                    // 如果是加载操作，从SAF URI读取内容
+                    String content = ExternalStorageUtils.readStringFromSafUri(this, uri);
+                    if (content != null) {
+                        inputBox.setText(content);
+                        Toast.makeText(this, "文本已成功从外部存储加载", Toast.LENGTH_SHORT).show();
+                    } else {
+                        Toast.makeText(this, "加载失败", Toast.LENGTH_SHORT).show();
+                    }
+                    // 重置状态
+                    pendingOperation = OperationType.NONE;
+                }
+            }
         }
     }
 }

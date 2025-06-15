@@ -43,6 +43,9 @@ public class ExternalStorageUtils {
 
     // 存储文件URI，用于权限请求
     private static Uri lastSavedFileUri = null;
+    
+    // 保存SAF URI
+    private static Uri safUri = null;
 
     /**
      * 保存字符串到外部存储，兼容所有Android主流版本，内容Base64编码
@@ -111,7 +114,7 @@ public class ExternalStorageUtils {
             Log.d(TAG, "设置相对路径: " + relativePath);
         }
         
-        Uri uri = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+        Uri uri = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL);
         Uri fileUri = null;
         
         try {
@@ -182,16 +185,35 @@ public class ExternalStorageUtils {
     public static List<Uri> getPendingPermissionUris() {
         List<Uri> uris = new ArrayList<>();
         if (lastSavedFileUri != null) {
-            uris.add(lastSavedFileUri);
+            try {
+                // 确保URI是媒体项目URI
+                String uriString = lastSavedFileUri.toString();
+                Log.d(TAG, "检查URI是否为媒体项目: " + uriString);
+                
+                // 只接受MediaStore的URI
+                if (uriString.startsWith("content://media/")) {
+                    // 确保URI指向Downloads目录下的媒体项目
+                    if (uriString.contains("external") && uriString.contains("downloads")) {
+                        Log.d(TAG, "添加有效的媒体URI到权限请求列表: " + lastSavedFileUri);
+                        uris.add(lastSavedFileUri);
+                    } else {
+                        Log.e(TAG, "URI不是下载目录中的媒体项目: " + lastSavedFileUri);
+                    }
+                } else {
+                    Log.e(TAG, "URI不是媒体项目: " + lastSavedFileUri);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "处理URI时发生异常", e);
+            }
         }
         return uris;
     }
 
     /**
      * 尝试直接读取已知路径的文件
-     * 当MediaStore查询失败时使用，如果文件存在但没有权限会返回对应的URI用于请求权限
+     * 当MediaStore查询失败时使用，如果文件存在但没有权限会抛出SecurityException
      */
-    private static String tryReadExistingFile(Context context) {
+    private static String tryReadExistingFile(Context context) throws SecurityException {
         try {
             File downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
             File targetDir = new File(downloadDir, HIDDEN_DIR);
@@ -212,6 +234,8 @@ public class ExternalStorageUtils {
             if (fileUri != null) {
                 Log.d(TAG, "获取到文件URI: " + fileUri);
                 lastSavedFileUri = fileUri; // 保存URI用于权限请求
+            } else {
+                Log.d(TAG, "无法获取文件URI，但仍将尝试直接读取");
             }
             
             try {
@@ -232,9 +256,21 @@ public class ExternalStorageUtils {
                 }
             } catch (IOException e) {
                 Log.e(TAG, "直接读取文件失败: " + e.getMessage(), e);
-                // 文件存在但无法读取，可能是权限问题
+                
+                // 检查是否是权限问题
+                if (e.getCause() instanceof SecurityException || e.getMessage() != null && e.getMessage().contains("Permission denied")) {
+                    Log.e(TAG, "读取文件失败，权限被拒绝", e);
+                    
+                    // 如果是权限问题，抛出SecurityException
+                    throw new SecurityException("无法访问文件，需要权限: " + targetFile.getAbsolutePath(), e);
+                }
+                
+                // 其他IO错误
                 return null;
             }
+        } catch (SecurityException e) {
+            // 直接重新抛出安全异常
+            throw e;
         } catch (Exception e) {
             Log.e(TAG, "尝试读取已知文件时发生异常", e);
             return null;
@@ -248,41 +284,62 @@ public class ExternalStorageUtils {
         try {
             // 先尝试通过MediaStore查询
             ContentResolver resolver = context.getContentResolver();
-            String selection;
-            String[] selectionArgs;
+            
+            // 确保使用正确的媒体URI
+            Uri queryUri = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL);
+            Log.d(TAG, "使用媒体URI查询: " + queryUri);
+            
+            String selection = MediaStore.MediaColumns.DISPLAY_NAME + "=?";
+            String[] selectionArgs = new String[]{FILE_NAME_ANDROID11};
             
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 selection = MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " +
                         MediaStore.MediaColumns.RELATIVE_PATH + "=?";
                 String relativePath = Environment.DIRECTORY_DOWNLOADS + "/" + HIDDEN_DIR + "/";
                 selectionArgs = new String[]{FILE_NAME_ANDROID11, relativePath};
-            } else {
-                selection = MediaStore.MediaColumns.DISPLAY_NAME + "=?";
-                selectionArgs = new String[]{FILE_NAME_ANDROID11};
             }
             
             try (Cursor cursor = resolver.query(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    queryUri,
                     new String[]{MediaStore.MediaColumns._ID},
                     selection, selectionArgs, null)) {
                 
                 if (cursor != null && cursor.moveToFirst()) {
                     long id = cursor.getLong(0);
-                    return ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id);
+                    Uri uri = ContentUris.withAppendedId(queryUri, id);
+                    Log.d(TAG, "找到媒体项目URI: " + uri);
+                    return uri;
                 }
             }
             
-            // 如果MediaStore查询失败，尝试使用FileProvider或直接构建content URI
+            // 如果查询失败，尝试创建媒体项目
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // 对于Android 10+，构建一个可能的URI
+                Log.d(TAG, "尝试创建新的媒体项目");
                 ContentValues values = new ContentValues();
-                values.put(MediaStore.MediaColumns.DISPLAY_NAME, file.getName());
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, FILE_NAME_ANDROID11);
                 values.put(MediaStore.MediaColumns.MIME_TYPE, "text/plain");
                 values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + HIDDEN_DIR);
                 
-                return resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                Uri uri = resolver.insert(queryUri, values);
+                if (uri != null) {
+                    Log.d(TAG, "成功创建媒体项目: " + uri);
+                    
+                    // 写入一些默认内容
+                    try (OutputStream os = resolver.openOutputStream(uri)) {
+                        if (os != null) {
+                            String defaultContent = encodeBase64("这是一个默认的测试内容");
+                            os.write(defaultContent.getBytes(StandardCharsets.UTF_8));
+                            Log.d(TAG, "写入默认内容到新创建的媒体项目");
+                        }
+                    } catch (IOException e) {
+                        Log.e(TAG, "写入媒体项目失败", e);
+                    }
+                    
+                    return uri;
+                }
             }
             
+            Log.d(TAG, "未找到文件的MediaStore记录，无法获取有效URI用于权限请求");
             return null;
         } catch (Exception e) {
             Log.e(TAG, "获取文件URI失败", e);
@@ -301,6 +358,10 @@ public class ExternalStorageUtils {
         String selection;
         String[] selectionArgs;
         
+        // 确保使用正确的媒体URI
+        Uri queryUri = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL);
+        Log.d(TAG, "使用媒体URI查询: " + queryUri);
+        
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             // 修改查询条件，去掉通配符，使用精确路径匹配
             selection = MediaStore.MediaColumns.RELATIVE_PATH + "=? AND " +
@@ -314,7 +375,6 @@ public class ExternalStorageUtils {
             Log.d(TAG, "查询条件: 文件名=" + FILE_NAME_ANDROID11);
         }
         
-        Uri queryUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
         Log.d(TAG, "查询URI: " + queryUri);
         
         // 尝试先扫描下载目录，确保MediaStore能识别到文件
@@ -382,6 +442,31 @@ public class ExternalStorageUtils {
                     return result;
                 }
                 
+                // 尝试创建新的媒体项目
+                Uri uri = getUriForFile(context, new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), HIDDEN_DIR + "/" + FILE_NAME_ANDROID11));
+                if (uri != null) {
+                    Log.d(TAG, "成功创建媒体项目，URI: " + uri);
+                    lastSavedFileUri = uri;
+                    
+                    // 尝试读取新创建的媒体项目
+                    try (InputStream is = resolver.openInputStream(uri)) {
+                        if (is != null) {
+                            BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+                            StringBuilder sb = new StringBuilder();
+                            String line;
+                            while ((line = reader.readLine()) != null) {
+                                sb.append(line).append("\n");
+                            }
+                            if (sb.length() > 0) sb.setLength(sb.length() - 1);
+                            
+                            Log.d(TAG, "成功从新创建的媒体项目读取数据，内容长度: " + sb.length() + " 字符");
+                            return sb.toString();
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "读取新创建的媒体项目失败", e);
+                    }
+                }
+                
                 // 列出所有下载目录中的文件，帮助调试
                 listAllDownloadFiles(context);
                 
@@ -405,27 +490,45 @@ public class ExternalStorageUtils {
     /**
      * 读取外部存储的字符串，自动Base64解码，兼容所有Android主流版本
      * 优化后可以解决应用卸载重装后UID变化导致无法访问文件的问题
+     * 如果因权限问题无法访问文件，会抛出SecurityException
      */
-    public static String readStringFromExternalStorage(Context context) {
+    public static String readStringFromExternalStorage(Context context) throws SecurityException {
         Log.d(TAG, "开始从外部存储读取数据");
         Log.d(TAG, "当前Android版本: " + Build.VERSION.SDK_INT);
+        
+        // 首先尝试使用SAF URI读取
+        if (safUri != null) {
+            Log.d(TAG, "尝试使用已保存的SAF URI读取文件: " + safUri);
+            String content = readStringFromSafUri(context, safUri);
+            if (content != null) {
+                Log.d(TAG, "成功从SAF URI读取文件内容");
+                return content;
+            }
+            Log.d(TAG, "从SAF URI读取失败，尝试其他方法");
+        }
         
         String encoded = null;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             // Android 10+，使用MediaStore API
             Log.d(TAG, "使用MediaStore API读取数据");
-            encoded = readStringFromMediaStore(context);
-            if (encoded != null) {
-                Log.d(TAG, "从MediaStore成功读取数据，长度: " + encoded.length() + " 字符");
-            } else {
-                Log.e(TAG, "从MediaStore读取数据失败，返回null");
-                
-                // 如果MediaStore读取失败，尝试直接读取已知文件
-                Log.d(TAG, "MediaStore读取失败，尝试直接读取已知路径的文件");
-                encoded = tryReadExistingFile(context);
+            try {
+                encoded = readStringFromMediaStore(context);
                 if (encoded != null) {
-                    Log.d(TAG, "成功直接读取已知文件");
+                    Log.d(TAG, "从MediaStore成功读取数据，长度: " + encoded.length() + " 字符");
+                } else {
+                    Log.e(TAG, "从MediaStore读取数据失败，返回null");
+                    
+                    // 如果MediaStore读取失败，尝试直接读取已知文件
+                    Log.d(TAG, "MediaStore读取失败，尝试直接读取已知路径的文件");
+                    encoded = tryReadExistingFile(context);
+                    if (encoded != null) {
+                        Log.d(TAG, "成功直接读取已知文件");
+                    }
                 }
+            } catch (SecurityException e) {
+                Log.e(TAG, "读取文件时发生安全异常，需要请求权限", e);
+                // 重新抛出异常，让MainActivity处理
+                throw e;
             }
             return encoded == null ? null : decodeBase64(encoded);
         } else {
@@ -466,14 +569,40 @@ public class ExternalStorageUtils {
     /**
      * 尝试扫描媒体文件，确保MediaStore能识别到文件
      * 特别是应用卸载重装后，需要重新扫描
+     * 此方法设为public，可以从MainActivity调用
      */
-    private static void scanMediaFile(Context context) {
+    public static void scanMediaFile(Context context) {
         try {
             File downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
             File targetDir = new File(downloadDir, HIDDEN_DIR);
             File targetFile = new File(targetDir, FILE_NAME_ANDROID11);
             
             Log.d(TAG, "尝试扫描文件: " + targetFile.getAbsolutePath() + "，文件是否存在: " + targetFile.exists());
+            
+            // 如果文件不存在，尝试创建一个空文件
+            if (!targetFile.exists()) {
+                try {
+                    if (!targetDir.exists()) {
+                        targetDir.mkdirs();
+                    }
+                    
+                    // 创建一个空文件，确保有东西可以扫描
+                    if (targetFile.createNewFile()) {
+                        Log.d(TAG, "创建了空文件: " + targetFile.getAbsolutePath());
+                        
+                        // 写入一些默认内容
+                        try (FileOutputStream fos = new FileOutputStream(targetFile)) {
+                            String defaultContent = encodeBase64("这是一个默认的测试内容");
+                            fos.write(defaultContent.getBytes(StandardCharsets.UTF_8));
+                            Log.d(TAG, "写入默认内容到新创建的文件");
+                        } catch (IOException e) {
+                            Log.e(TAG, "写入默认内容失败", e);
+                        }
+                    }
+                } catch (IOException e) {
+                    Log.e(TAG, "创建文件失败", e);
+                }
+            }
             
             if (targetFile.exists()) {
                 MediaScannerConnection.scanFile(
@@ -483,6 +612,15 @@ public class ExternalStorageUtils {
                     (path, uri) -> {
                         if (uri != null) {
                             Log.d(TAG, "媒体扫描完成，路径: " + path + "，URI: " + uri);
+                            // 保存扫描后的URI用于权限请求
+                            lastSavedFileUri = uri;
+                            
+                            // 尝试通过MediaStore查询获取正确的媒体URI
+                            Uri mediaUri = getUriForFile(context, targetFile);
+                            if (mediaUri != null) {
+                                Log.d(TAG, "获取到媒体URI: " + mediaUri);
+                                lastSavedFileUri = mediaUri;
+                            }
                         } else {
                             Log.e(TAG, "媒体扫描失败，路径: " + path);
                         }
@@ -583,6 +721,90 @@ public class ExternalStorageUtils {
         }
     }
 
+    /**
+     * 设置SAF URI
+     */
+    public static void setSafUri(Uri uri) {
+        safUri = uri;
+        Log.d(TAG, "设置SAF URI: " + uri);
+    }
+    
+    /**
+     * 获取SAF URI
+     */
+    public static Uri getSafUri() {
+        return safUri;
+    }
+    
+    /**
+     * 通过SAF URI读取文件内容
+     */
+    public static String readStringFromSafUri(Context context, Uri uri) {
+        Log.d(TAG, "从SAF URI读取内容: " + uri);
+        try {
+            InputStream inputStream = context.getContentResolver().openInputStream(uri);
+            if (inputStream == null) {
+                Log.e(TAG, "无法打开输入流");
+                return null;
+            }
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8));
+            StringBuilder stringBuilder = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                stringBuilder.append(line).append("\n");
+            }
+            if (stringBuilder.length() > 0) {
+                stringBuilder.setLength(stringBuilder.length() - 1);
+            }
+            reader.close();
+            inputStream.close();
+            
+            String content = stringBuilder.toString();
+            Log.d(TAG, "成功从SAF URI读取内容，长度: " + content.length() + " 字符");
+            
+            // 尝试Base64解码
+            try {
+                return decodeBase64(content);
+            } catch (Exception e) {
+                Log.w(TAG, "内容不是Base64编码，返回原始内容");
+                return content;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "从SAF URI读取内容失败", e);
+            return null;
+        }
+    }
+    
+    /**
+     * 通过SAF URI写入文件内容
+     */
+    public static boolean writeStringToSafUri(Context context, Uri uri, String content) {
+        Log.d(TAG, "写入内容到SAF URI: " + uri);
+        try {
+            // Base64编码内容
+            String encodedContent = encodeBase64(content);
+            
+            OutputStream outputStream = context.getContentResolver().openOutputStream(uri, "wt");
+            if (outputStream == null) {
+                Log.e(TAG, "无法打开输出流");
+                return false;
+            }
+            
+            OutputStreamWriter writer = new OutputStreamWriter(outputStream, StandardCharsets.UTF_8);
+            writer.write(encodedContent);
+            writer.flush();
+            writer.close();
+            outputStream.close();
+            
+            Log.d(TAG, "成功写入内容到SAF URI，长度: " + encodedContent.length() + " 字符");
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "写入内容到SAF URI失败", e);
+            return false;
+        }
+    }
+
     // Base64解码
     private static String decodeBase64(String encoded) {
         try {
@@ -592,6 +814,19 @@ public class ExternalStorageUtils {
             return result;
         } catch (Exception e) {
             Log.e(TAG, "Base64解码失败", e);
+            return null;
+        }
+    }
+    
+    // Base64编码
+    private static String encodeBase64(String data) {
+        try {
+            byte[] encoded = Base64.encode(data.getBytes(StandardCharsets.UTF_8), Base64.DEFAULT);
+            String result = new String(encoded, StandardCharsets.UTF_8);
+            Log.d(TAG, "Base64编码成功，编码前长度: " + data.length() + "，编码后长度: " + result.length());
+            return result;
+        } catch (Exception e) {
+            Log.e(TAG, "Base64编码失败", e);
             return null;
         }
     }
